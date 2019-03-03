@@ -3,7 +3,7 @@
 ## Source: https://github.com/hexojs/hexo/
 
 # Site
-title: klbusz learning
+title: Learning notes
 subtitle:
 description: 
 keywords:
@@ -54,7 +54,7 @@ index_generator:
   order_by: -date
   
 # Category & Tag
-default_category: uncategorized
+default_category: #uncategorized
 category_map:
 tag_map:
 
