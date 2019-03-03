@@ -75,6 +75,10 @@ pagination_dir: page
 ## Themes: https://hexo.io/themes/
 theme: landscape
 
+toc:
+  maxdepth: 3
+  class: toc
+
 # Deployment
 ## Docs: https://hexo.io/docs/deployment.html
 deploy:
