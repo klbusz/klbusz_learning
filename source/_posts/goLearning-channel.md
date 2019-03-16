@@ -8,6 +8,8 @@ tags:
 - go
 ---
 
+<!-- toc -->
+
 # 简介
 channel是Go语言的重要特性，和goroutine配合使用，使得Go语言的并发编程变得方便和有趣。
 
