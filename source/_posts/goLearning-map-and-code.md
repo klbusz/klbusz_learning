@@ -169,8 +169,9 @@ type bmap struct {
 ## map的创建
 
 ```go
-//hint > int值范围时使用，将hint改为0
+
 func makemap64(t *maptype, hint int64, h *hmap) *hmap {
+	//这里为何不和channel一样panic？
 	if int64(int(hint)) != hint {
 		hint = 0
 	}
@@ -776,28 +777,29 @@ search:
 ## map 的迭代器
 
 ```go
-// A hash iteration structure.
+// 迭代器结构体
 // If you modify hiter, also change cmd/compile/internal/gc/reflect.go to indicate
 // the layout of this structure.
 type hiter struct {
-	key         unsafe.Pointer // Must be in first position.  Write nil to indicate iteration end (see cmd/internal/gc/range.go).
-	value       unsafe.Pointer // Must be in second position (see cmd/internal/gc/range.go).
+	key         unsafe.Pointer // 必须放在第一位.  当迭代结束时置为nil key和value在编译中采用了Field(num)的方式访问，所以位置必须固定 (see cmd/compile/internal/gc/range.go:301).
+	value       unsafe.Pointer // 必须放在第二位 (see cmd/compile/internal/gc/range.go:302).
 	t           *maptype
 	h           *hmap
-	buckets     unsafe.Pointer // bucket ptr at hash_iter initialization time
-	bptr        *bmap          // current bucket
+	buckets     unsafe.Pointer // 当迭代器初始化时的bucket 指针
+	bptr        *bmap          // 当前的bucket地址
 	overflow    *[]*bmap       // keeps overflow buckets of hmap.buckets alive
 	oldoverflow *[]*bmap       // keeps overflow buckets of hmap.oldbuckets alive
 	startBucket uintptr        // bucket iteration started at
-	offset      uint8          // intra-bucket offset to start from during iteration (should be big enough to hold bucketCnt-1)
-	wrapped     bool           // already wrapped around from end of bucket array to beginning
+	offset      uint8          // 在遍历一个bucket时的开始偏移量(每个bmap的遍历避免都从0开始) (要保证其能保存一个bucketcnt-1大小的数字)
+	wrapped     bool           // 是否已遍历一遍
 	B           uint8
 	i           uint8
 	bucket      uintptr
 	checkBucket uintptr
 }
 
-// mapiterinit initializes the hiter struct used for ranging over maps.
+// mapiterinit用于将在range map时所使用的iter初始化
+
 // The hiter struct pointed to by 'it' is allocated on the stack
 // by the compilers order pass or on the heap by reflect_mapiterinit.
 // Both need to have zeroed hiter since the struct contains pointers.
@@ -830,7 +832,9 @@ func mapiterinit(t *maptype, h *hmap, it *hiter) {
 		it.oldoverflow = h.extra.oldoverflow
 	}
 
-	// decide where to start
+	// 生成迭代开始的位置，和bmap遍历时的开始位置，
+	// 当对一个bmap遍历时，使用根据随机数计算出的[offset]作为开始位置，而不是[0]
+	// 以实现map 遍历随机性
 	r := uintptr(fastrand())
 	if h.B > 31-bucketCntBits {
 		r += uintptr(fastrand()) << 31
@@ -856,6 +860,7 @@ func mapiternext(it *hiter) {
 		callerpc := getcallerpc()
 		racereadpc(unsafe.Pointer(h), callerpc, funcPC(mapiternext))
 	}
+
 	if h.flags&hashWriting != 0 {
 		throw("concurrent map iteration and map write")
 	}
@@ -868,17 +873,17 @@ func mapiternext(it *hiter) {
 
 next:
 	if b == nil {
+		// 判断是否遍历完成，完成则将迭代器的key、value置为nil，标志结束
 		if bucket == it.startBucket && it.wrapped {
 			// end of iteration
 			it.key = nil
 			it.value = nil
 			return
 		}
+		// 计算需要处理的bucket链表位置
 		if h.growing() && it.B == h.B {
-			// Iterator was started in the middle of a grow, and the grow isn't done yet.
-			// If the bucket we're looking at hasn't been filled in yet (i.e. the old
-			// bucket hasn't been evacuated) then we need to iterate through the old
-			// bucket and only return the ones that will be migrated to this bucket.
+			// 迭代发生在map的grow过程中，old bucket尚未迁移完毕，迭代oldbuckets
+			// 计算当前bucket所对应的oldbucket位置
 			oldbucket := bucket & it.h.oldbucketmask()
 			b = (*bmap)(add(h.oldbuckets, oldbucket*uintptr(t.bucketsize)))
 			if !evacuated(b) {
@@ -898,8 +903,11 @@ next:
 		}
 		i = 0
 	}
+	// 遍历当前bmap
 	for ; i < bucketCnt; i++ {
+		// 根据遍历偏移量，确定遍历位置
 		offi := (i + it.offset) & (bucketCnt - 1)
+		// 当前槽位为空，处理下一个
 		if isEmpty(b.tophash[offi]) || b.tophash[offi] == evacuatedEmpty {
 			// TODO: emptyRest is hard to use here, as we start iterating
 			// in the middle of a bucket. It's feasible, just tricky.
@@ -911,13 +919,11 @@ next:
 		}
 		v := add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+uintptr(offi)*uintptr(t.valuesize))
 		if checkBucket != noCheck && !h.sameSizeGrow() {
-			// Special case: iterator was started during a grow to a larger size
-			// and the grow is not done yet. We're working on a bucket whose
-			// oldbucket has not been evacuated yet. Or at least, it wasn't
-			// evacuated when we started the bucket. So we're iterating
-			// through the oldbucket, skipping any keys that will go
-			// to the other new bucket (each oldbucket expands to two
-			// buckets during a grow).
+			// 对于二倍grow的情况，根据扩展后bucket位置找到其对应的oldbucket位置
+			// 当在oldbuckets上迭代时，将会迁移到另外bucket上的元素跳过
+			// 例如 当前B 由3 扩展为 4，则 oldbucket 1分裂为bucket 1和bucket 9
+			// 当迭代器迭代到bucket 9 上时，仅处理oldbucket 1 上会迁移到bucket 9上的元素，而将其他的跳过
+			// 判断当前元素会迁移不会迁移到当前处理的bucket上，原理同迁移元素时判断元素是迁移到低址部分还是高址部分
 			if t.reflexivekey() || alg.equal(k, k) {
 				// If the item in the oldbucket is not destined for
 				// the current new bucket in the iteration, skip it.
@@ -940,21 +946,16 @@ next:
 		}
 		if (b.tophash[offi] != evacuatedX && b.tophash[offi] != evacuatedY) ||
 			!(t.reflexivekey() || alg.equal(k, k)) {
-			// This is the golden data, we can return it.
-			// OR
-			// key!=key, so the entry can't be deleted or updated, so we can just return it.
-			// That's lucky for us because when key!=key we can't look it up successfully.
+			// 当元素未被迁移时直接返回
+			// 当key !=key 时，也可以直接返回，因为该元素已经不可能被更新或者删除
 			it.key = k
 			if t.indirectvalue() {
 				v = *((*unsafe.Pointer)(v))
 			}
 			it.value = v
 		} else {
-			// The hash table has grown since the iterator was started.
-			// The golden data for this key is now somewhere else.
-			// Check the current hash table for the data.
-			// This code handles the case where the key
-			// has been deleted, updated, or deleted and reinserted.
+			// 存在key迁移的问题，使用mapaccessK方法读取当前key值
+			// 因为在迁移过程中该key可能被删除或者修改，因此当前位置的值已不再准确
 			// NOTE: we need to regrab the key as it has potentially been
 			// updated to an equal() but not identical key (e.g. +0.0 vs -0.0).
 			rk, rv := mapaccessK(t, h, k)
